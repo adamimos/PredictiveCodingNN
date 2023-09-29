@@ -312,6 +312,47 @@ class PredictiveCodingNetwork(nn.Module):
             self.zero_grad()
 
         return x
+    
+
+    def compute_prediction(self, images, layer_index=None, timesteps=100):
+        # Run the batch through the network
+        x = self(images, timesteps=timesteps, train_U=False)
+
+        # If layer_index is specified, compute prediction for that layer only
+        if layer_index is not None:
+            layer = self.layers[layer_index]
+            return self._compute_layer_prediction(layer)
+
+        # Otherwise, compute predictions for all layers
+        else:
+            all_predictions = []
+            for layer in self.layers:
+                all_predictions.append(self._compute_layer_prediction(layer))
+            return all_predictions
+
+    def _compute_layer_prediction(self, layer, r=None):
+        if r is None:
+            r = layer.r.detach().numpy()
+        U = layer.U.detach().numpy()
+        batch_size = r.shape[0]
+
+        prediction = einsum('causes chan kernh kernw, batch causes npatchesh npatchesw -> batch chan kernh kernw npatchesh npatchesw', U, r)
+
+        fold = layer.fold
+        unfold = layer.unfold
+        inputs_ones_size = (batch_size, layer.input_size[0], layer.input_size[1], layer.input_size[2])
+        input_ones = torch.ones(inputs_ones_size)
+        prediction = prediction.reshape(prediction.shape[0], prediction.shape[1]*prediction.shape[2]*prediction.shape[3], prediction.shape[4]*prediction.shape[5])
+        prediction = fold(torch.from_numpy(prediction))
+
+        divisor = fold(unfold(input_ones))
+        prediction = prediction / divisor
+
+        return prediction
+
+    
+
+
 
 #%%
 # load library
@@ -320,10 +361,6 @@ import scipy.ndimage
 import numpy as np
 import matplotlib.pyplot as plt
 
-IMAGE_FOLDER = './RaoBallardImages/'
-
-# load the .mat file in the folder, shape is (512, 512, 10) which is (height, width, number of images)
-images = scipy.io.loadmat(IMAGE_FOLDER + 'IMAGES_RAW.mat')['IMAGESr']
 
 #%% load cfar images, download through torch
 import torchvision
@@ -341,46 +378,16 @@ trainloader = torch.utils.data.DataLoader(trainset, batch_size=500,
                                             shuffle=True)
 # get an image and plot it
 dataiter = iter(trainloader)
-images, labels = dataiter.next()
+images, labels = next(dataiter)
 # plot an image
 plt.imshow(np.transpose(images[0], (1, 2, 0)))
-
-#%%
-# make a predictive coding network with 3 layers
-
-# make a 1 layer model
-# describe the inputs
-# input_size is the size of the input image, which is (channels, height, width)
-# n_layers is the number of layers in the network
-# n_causes is the number of causes in each layer
-# kernel_size is the size of the kernel in each layer
-# stride is the stride of the kernel in each layer
-# padding is the padding of the kernel in each layer
-# lam is the lambda parameter in each layer, which is the weight of the reconstruction loss
-# alpha is the alpha parameter in each layer, which is the weight of the sparsity loss
-# k1 is the k1 parameter in each layer, which is the learning rate of r
-# k2 is the k2 parameter in each layer, which is the learning rate of U
-# sigma2 is the sigma2 parameter in each layer, which is the variance of the noise in the reconstruction loss
-model = PredictiveCodingNetwork(input_size=(1, 512, 512), n_layers=2, n_causes=[32, 128], kernel_size=[16, 2], stride=[5, 2], padding=0,
-                    lam=1., alpha=0.1, k1=.05, k2=0.0001, sigma2=10.)
-
-# run the network for 1 timestep
-# with a batch of 10 images
-x = images[:, :, 0:10].astype(np.float32)
-# convert to torch
-x = torch.from_numpy(x)
-# rearrange the shape to be (batch_size, channels, height, width)
-x = x.permute(2, 0, 1).unsqueeze(1)
-# what is the shape
-print(x.shape)
-x = model(x, timesteps=500, train_U=True)
 
 
 # %%
 
 # get an image and plot it
 dataiter = iter(trainloader)
-images, labels = dataiter.next()
+images, labels = next(dataiter)
 # plot an image
 plt.imshow(np.transpose(images[0], (1, 2, 0)))
 
@@ -389,8 +396,12 @@ image_shape = images[0].shape
 print(image_shape)
 
 model = PredictiveCodingNetwork(input_size=(3, image_shape[1], image_shape[2]), 
-                n_layers=2, n_causes=[8, 10], kernel_size=[[8,8],[3,3]], stride=[4, 2], padding=0,
+                n_layers=2, n_causes=[20, 50], kernel_size=[[5,5],[3,3]], stride=[3, 2], padding=0,
                     lam=0.1, alpha=0.1, k1=.005, k2=0.05, sigma2=10.)
+
+#model = PredictiveCodingNetwork(input_size=(3, image_shape[1], image_shape[2]), 
+#                n_layers=2, n_causes=[32, 128], kernel_size=[[15,15],[3,3]], stride=[5, 3], padding=0,
+#                    lam=0.02, alpha=[0.05, 0.005], k1=0.05, k2=0.005, sigma2=[1., 10.])
 
 
 
@@ -398,20 +409,23 @@ model = PredictiveCodingNetwork(input_size=(3, image_shape[1], image_shape[2]),
 x = images
 for i in range(10):
     dataiter = iter(trainloader)
-    images, labels = dataiter.next()
-    _ = model(x, timesteps=i*10, train_U=True)
+    images, labels = next(dataiter)
+    _ = model(x, timesteps=100, train_U=True)
 
     # decrease k2 by dividing by 1.05
     for layer in model.layers:
         layer.k2 /= 1.05
-
 # %%
+
+#%%
 
 # get U from the first layer
 U0 = model.layers[0].U.detach().numpy()
 # shape of U is (n_causes, channels, kernel_height, kernel_width)
 print(U0.shape)
 # viusalize the first 16 causes
+plt.figure(figsize=(10, 10))
+plt.subplots_adjust(wspace=.1, hspace=.1)
 for i in range(8):
     plt.subplot(4, 4, i+1)
     to_plot = U0[i, :, :, :] #  (channels, kernel_height, kernel_width)
@@ -420,23 +434,55 @@ for i in range(8):
     to_plot = np.transpose(to_plot, (1, 2, 0)) # (kernel_height, kernel_width, channels)
     plt.imshow(to_plot)
     plt.axis('off')
+
 #%%
-# get U from the second layer
-U = model.layers[1].U.detach().numpy()
-print(U.shape)
-# shape of U is (n_causes, channels, kernel_height, kernel_width)
-# viusalize the first 16 causes
-for i in range(16):
-    plt.subplot(4, 4, i+1)
-    U[i, 0, :, :]
+# get predictions
+predictions = model.compute_prediction(images, layer_index=1, timesteps=100)
+
+#%%
+init_preds = model._compute_layer_prediction(model.layers[0],r=predictions)
+
+#%%
+predictions = model.compute_prediction(images, layer_index=0, timesteps=100)
+#%%
+# visualize the first 8 predictions
+# first column is prediction, second column is input, third is difference
+# get rid of nan values
+# convert to numpy
+predictions = np.array(predictions)
+images = np.array(images)
+# crop images to get rid of nans
+# first take the first prediction and figure out the non nan mask
+# then apply the mask to all predictions
 
 
+
+plt.figure(figsize=(10, 10))
+plt.subplots_adjust(wspace=.1, hspace=.1)
+for i in range(8):
+    plt.subplot(4, 4, i*2+1)
+    to_plot = predictions[i]# (channels, kernel_height, kernel_width)
+    # only keep inds where non_nan_mask is true
+    # find the indices of non-NaN values
+
+    
+    # make sure image is between 0 and 1
+    #to_plot = (to_plot - to_plot.min())/(to_plot.max() - to_plot.min())
+    to_plot = np.transpose(to_plot, (1, 2, 0)) # (kernel_height, kernel_width, channels)
+    plt.imshow(to_plot)
+    plt.axis('off')
+    plt.subplot(4, 4, i*2+2)
+    to_plot = images[i, :, :, :] # (channels, kernel_height, kernel_width)
+    # make sure image is between 0 and 1
+    to_plot = (to_plot - to_plot.min())/(to_plot.max() - to_plot.min())
+    to_plot = np.transpose(to_plot, (1, 2, 0)) # (kernel_height, kernel_width, channels)
+    plt.imshow(to_plot)
     plt.axis('off')
 # %%
 # take a single image
 # get the next dataset
 dataiter = iter(trainloader)
-images, labels = dataiter.next()
+images, labels = next(dataiter)
 image = images[0]
 # lets look at it in a subplot
 plt.subplot(1, 2, 1)
@@ -445,39 +491,36 @@ plt.imshow(np.transpose(image, (1, 2, 0)))
 # lets run the batch through the network
 x = images 
 x = model(x, timesteps=100, train_U=False)
-
+#%%
+l = 1
 # get the finale value of r in the first layer
-r0 = model.layers[0].r.detach().numpy()
+r0 = model.layers[l].r.detach().numpy()
 # shape of r is (batch_size, n_causes, n_patches_h, n_patches_w)
 print(r0.shape)
 # get the final value of U in the first layer
-U0 = model.layers[0].U.detach().numpy()
+U0 = model.layers[l].U.detach().numpy()
 # shape of U is (n_causes, channels, kernel_height, kernel_width)
-print(U0.shape)
+print('Ushape', U0.shape)
 
 # combine U0 and r0 to get the final value of the first layer
 # shape of x_hat is (batch_size, channels, height, width)
 prediction = einsum('causes chan kernh kernw, batch causes npatchesh npatchesw -> batch chan kernh kernw npatchesh npatchesw', U0, r0)
-print(prediction.shape) # (batch_size, channels, height, width, n_patches_h, n_patches_w)
-# fold this back up to be an image
-# get the unfold from the first layer
-unfold = model.layers[0].unfold
-# get the unfold params
-unfold_params = unfold.parameters()
-# PRINT THE PARAMS
-# get stride of the unfold
-stride = unfold.stride
-fold = torch.nn.Fold((32,32), kernel_size=unfold.kernel_size, stride=stride)
+print('prediction shape', prediction.shape) # (batch_size, channels, height, width, n_patches_h, n_patches_w)
+unfold = model.layers[l].unfold
+fold = model.layers[l].fold
 # input_ones is a torch.ones with size (batch_size, channels, height, width)
-input_ones = torch.ones(x.shape)
+inputs_ones_size = (x.shape[0], model.layers[l].input_size[0], model.layers[l].input_size[1], model.layers[l].input_size[2])
+input_ones = torch.ones(inputs_ones_size)
 prediction = prediction.reshape(prediction.shape[0], prediction.shape[1]*prediction.shape[2]*prediction.shape[3], prediction.shape[4]*prediction.shape[5])
 # rewrite the previous line
 # fold the prediction, conver to torch
 prediction = fold(torch.from_numpy(prediction))
 # we have to divide the prediction because of fold
 divisor = fold(unfold(input_ones))
-prediction = prediction / divisor
+prediction = prediction / divisor # (batch_size, channels, height, width)
+print('prediction shape', prediction.shape) # (batch_size, channels, height, width)
 
+#%%
 # look at the prediction in other subplot
 plt.subplot(1, 2, 2)
 plt.imshow(np.transpose(prediction[0].detach().numpy(), (1, 2, 0)))
@@ -485,9 +528,39 @@ plt.imshow(np.transpose(prediction[0].detach().numpy(), (1, 2, 0)))
 # put a title on the left for the original image
 plt.subplot(1, 2, 1)
 plt.title('True Image')
-# put a title on the right for the prediction
+
 plt.subplot(1, 2, 2)
 plt.title('Prediction')
+
+#%%
+print(images.shape)
+
+preds = model.compute_prediction(images, layer_index=0, timesteps=100)
+
+#%%
+# visualize the first preds
+plt.figure(figsize=(10, 10))
+plt.subplots_adjust(wspace=.1, hspace=.1)
+for i in range(8):
+    plt.subplot(4, 4, i+1)
+    to_plot = preds[i, :, :, :] #  (channels, kernel_height, kernel_width)
+    # make sure image is between 0 and 1
+    to_plot = (to_plot - to_plot.min())/(to_plot.max() - to_plot.min())
+    to_plot = np.transpose(to_plot, (1, 2, 0)) # (kernel_height, kernel_width, channels)
+    plt.imshow(to_plot)
+    plt.axis('off')
+
+# visualize the first images
+plt.figure(figsize=(10, 10))
+plt.subplots_adjust(wspace=.1, hspace=.1)
+for i in range(8):
+    plt.subplot(4, 4, i+1)
+    to_plot = images[i, :, :, :] #  (channels, kernel_height, kernel_width)
+    # make sure image is between 0 and 1
+    to_plot = (to_plot - to_plot.min())/(to_plot.max() - to_plot.min())
+    to_plot = np.transpose(to_plot, (1, 2, 0)) # (kernel_height, kernel_width, channels)
+    plt.imshow(to_plot)
+    plt.axis('off')
 #%%
 # now make a figure that shows the original image, the prediction, and the difference
 # and does it for 10 images, we already have all the predictions, no need to run the network again
@@ -526,102 +599,6 @@ for i in range(10):
     plt.imshow(np.transpose(error, (1, 2, 0)))
     # turn off the axis
     plt.axis('off')
-
-
-# %%
-
-# get r and U from the seconmd layer
-r1 = model.layers[1].r.detach().numpy()
-U1 = model.layers[1].U.detach().numpy()
-print('shape of r1 is', r1.shape) # (batch_size, n_causes, n_patches_h, n_patches_w)
-print('shape of U1 is', U1.shape) # (n_causes, channels, kernel_height, kernel_width)
-
-r0 = model.layers[0].r.detach().numpy()
-U0 = model.layers[0].U.detach().numpy()
-print('shape of r0 is', r0.shape) # (batch_size, n_causes, n_patches_h, n_patches_w)
-print('shape of U0 is', U0.shape) # (n_causes, channels, kernel_height, kernel_width)
-
-# in order to get the filter of the second lvevel, we can put in an r that is zero 
-# except for the first cause, which is one
-# we can do this by making a new r1_
-r1_ = np.zeros(r1.shape)
-r1_[:, 0, 1, 1] = 1
-
-# now we can get the filter of the second layer by multiplying r1_ by U1
-pred = einsum('causes chan kernh kernw, batch causes npatchesh npatchesw -> batch chan kernh kernw npatchesh npatchesw', U1, r1_)
-print('shape of pred is', pred.shape) # (batch_size, channels, height, width, n_patches_h, n_patches_w)
-# this should be a prediction for r0, but they arent the same shape
-print('shape of r0 is', r0.shape) # (batch_size, n_causes, n_patches_h, n_patches_w)
-# we need to fold this back up to be an image
-# get the unfold from the second layer
-unfold = model.layers[1].unfold
-# get the unfold params
-unfold_params = unfold.parameters()
-# PRINT THE PARAMS
-# get stride of the unfold
-stride = unfold.stride
-fold = torch.nn.Fold((7,7), kernel_size=unfold.kernel_size, stride=stride)
-# input_ones is a torch.ones with size (batch_size, channels, height, width)
-pred = pred.reshape(pred.shape[0], pred.shape[1]*pred.shape[2]*pred.shape[3], pred.shape[4]*pred.shape[5])
-# rewrite the previous line
-# fold the prediction, conver to torch
-pred = fold(torch.from_numpy(pred))
-# print the shape of the prediction
-print('shape of pred is', pred.shape) # (batch_size, channels, height, width)
-# we have to divide the prediction because of fold
-input_ones = torch.ones((500,8,7,7))
-divisor = fold(unfold(input_ones))
-pred = pred / divisor
-# print the shape of the prediction
-print('shape of pred is', pred.shape) # (batch_size, channels, height, width)
-p = pred.detach().numpy()
-# plot the filter
-to_plot = p[0,6, :, :]
-plt.imshow(to_plot)
-# p is shape (batch_size, channels, height, width)
-
-# now combine the two filters
-# get the filter of the first layer
-print('shape of U0 is', U0.shape) # (n_causes, channels, kernel_height, kernel_width)
-print('shape of p is', p.shape) # (batch_size, channels, height, width)
-x0 = einsum('batch causeprev nfiltsy nfiltsx, causeprev chanprev nfiltsyprev nfiltsxprev -> batch chanprev nfiltsyprev nfiltsxprev nfiltsy nfiltsx', p, U0)
-print('shape of x0 is', x0.shape) # (batch_size, channels, height, width, n_patches_h, n_patches_w)
-
-# ok now we need to get the prediction for the first layer
-
-
-# %%
-
-# get r and U from the seconmd layer
-r1 = model.layers[1].r.detach().numpy()
-U1 = model.layers[1].U.detach().numpy()
-print('shape of r1 is', r1.shape) # (batch_size, n_causes, n_patches_h, n_patches_w)
-print('shape of U1 is', U1.shape) # (n_causes, channels, kernel_height, kernel_width)
-
-r0 = model.layers[0].r.detach().numpy()
-U0 = model.layers[0].U.detach().numpy()
-print('shape of r0 is', r0.shape) # (batch_size, n_causes, n_patches_h, n_patches_w)
-print('shape of U0 is', U0.shape) # (n_causes, channels, kernel_height, kernel_width)
-
-# get the unfold
-unfold = model.layers[1].unfold
-# get the number of patches
-n_patches = model.layers[1].n_patches
-print('number of patches is', n_patches)
-# make a fold
-fold = torch.nn.Fold((7,7), kernel_size=unfold.kernel_size, stride=unfold.stride)
-
-U1_ = torch.Tensor(U1).reshape(U1.shape[0], U1.shape[1]*U1.shape[2]*U1.shape[3])
-p = fold(U1_)
-# %%
-
-# get the U from the second layer
-U1 = model.layers[1].U.detach().numpy()
-print('shape of U1 is', U1.shape) # (n_causes, channels, kernel_height, kernel_width)
-
-# get the unfold
-unfold = model.layers[1].unfold
-
 
 
 # %%
